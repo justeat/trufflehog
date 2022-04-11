@@ -11,6 +11,12 @@ Have questions? Feedback? Jump in slack and hang out with me
 https://join.slack.com/t/trufflehog-community/shared_invite/zt-pw2qbi43-Aa86hkiimstfdKH9UCpPzQ
 
 ## NEW
+truffleHog now has the ability to scan comments in both Pull Requests and Issues.
+
+```
+trufflehog --regex --entropy=False --pr_and_issue_comments --github_username=<username> --github_token=<personal_access_token> https://github.com/trufflesecurity/trufflehog.git
+```
+
 truffleHog previously functioned by running entropy checks on git diffs. This functionality still exists, but high signal regex checks have been added, and the ability to suppress entropy checking has also been added.
 
 
