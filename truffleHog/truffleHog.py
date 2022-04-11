@@ -12,10 +12,12 @@ import hashlib
 import tempfile
 import os
 import re
+import requests
 import json
 import stat
 from git import Repo
 from git import NULL_TREE
+from ratelimiter import RateLimiter
 from truffleHogRegexes.regexChecks import regexes
 
 
@@ -42,6 +44,9 @@ def main():
                              'effectively excluded via the --include_paths option.')
     parser.add_argument("--repo_path", type=str, dest="repo_path", help="Path to the cloned repo. If provided, git_url will not be used")
     parser.add_argument("--cleanup", dest="cleanup", action="store_true", help="Clean up all temporary result files")
+    parser.add_argument("--pr_and_issue_comments", dest="do_comments", action="store_true", help="Enable PR & Issue Comment checks")
+    parser.add_argument("--github_username", dest="github_username", help="GitHub Username necessary for analysing PR & Issue Comments")
+    parser.add_argument("--github_token", dest="github_token", help="GitHub Personal Access Token necessary for analysing PR & Issue Comments")
     parser.add_argument('git_url', type=str, help='URL for secret searching')
     parser.set_defaults(regex=False)
     parser.set_defaults(rules={})
@@ -52,6 +57,7 @@ def main():
     parser.set_defaults(branch=None)
     parser.set_defaults(repo_path=None)
     parser.set_defaults(cleanup=False)
+    parser.set_defaults(do_comments=False)
     args = parser.parse_args()
     rules = {}
     if args.rules:
@@ -91,6 +97,17 @@ def main():
 
     output = find_strings(args.git_url, args.since_commit, args.max_depth, args.output_json, args.do_regex, do_entropy,
             surpress_output=False, custom_regexes=regexes, branch=args.branch, repo_path=args.repo_path, path_inclusions=path_inclusions, path_exclusions=path_exclusions, allow=allow)
+
+    if args.do_comments:
+        if args.github_username == "":
+            raise(Exception("GitHub comment scanning requires a --github_username to be provided"))
+        
+        if args.github_token == "":
+            raise(Exception("GitHub comment scanning requires a --github_token to be provided"))
+        
+        commentIssues = find_strings_in_comments(args.git_url, args.github_username, args.github_token)
+        handle_results(output, output["issues_path"], commentIssues)
+        
     project_path = output["project_path"]
     if args.cleanup:
         clean_up(output)
@@ -183,6 +200,8 @@ def print_results(printJson, issue):
         print(json.dumps(issue, sort_keys=True))
     else:
         print("~~~~~~~~~~~~~~~~~~~~~")
+        type = "{}Type: {}{}".format(bcolors.OKGREEN, "Commit", bcolors.ENDC)
+        print(type)
         reason = "{}Reason: {}{}".format(bcolors.OKGREEN, reason, bcolors.ENDC)
         print(reason)
         dateStr = "{}Date: {}{}".format(bcolors.OKGREEN, commit_time, bcolors.ENDC)
@@ -204,6 +223,25 @@ def print_results(printJson, issue):
             commitStr = "{}Commit: {}{}".format(bcolors.OKGREEN, prev_commit.encode('utf-8'), bcolors.ENDC)
             print(commitStr)
             print(printableDiff.encode('utf-8'))
+        print("~~~~~~~~~~~~~~~~~~~~~")
+        
+def print_comment_results(printJson, issue):    
+    if printJson:
+        print(json.dumps(issue, sort_keys=True))
+    else:
+        print("~~~~~~~~~~~~~~~~~~~~~")
+        type = "{}Type: {}{}".format(bcolors.OKGREEN, issue['type'], bcolors.ENDC)
+        print(type)
+        reason = "{}Reason: {}{}".format(bcolors.OKGREEN, issue['reason'], bcolors.ENDC)
+        print(reason)
+        createdDateStr = "{}Date: {}{}".format(bcolors.OKGREEN, issue['createdAt'], bcolors.ENDC)
+        print(createdDateStr)
+        commentURLStr = "{}URL: {}{}".format(bcolors.OKGREEN, issue['htmlUrl'], bcolors.ENDC)
+        print(commentURLStr)
+        blameStr = "{}Author: {}{}".format(bcolors.OKGREEN, f"{issue['blameUsername']} [{issue['blameId']}]", bcolors.ENDC)
+        print(blameStr)
+        commentBodyStr = "{}Comment: \n{}{}".format(bcolors.OKGREEN, issue['printDiff'], bcolors.ENDC)
+        print(commentBodyStr)
         print("~~~~~~~~~~~~~~~~~~~~~")
 
 def find_entropy(printableDiff, commit_time, branch_name, prev_commit, blob, commitHash):
@@ -258,6 +296,35 @@ def regex_check(printableDiff, commit_time, branch_name, prev_commit, blob, comm
             foundRegex['printDiff'] = found_diff
             foundRegex['reason'] = key
             foundRegex['commitHash'] = prev_commit.hexsha
+            regex_matches.append(foundRegex)
+    return regex_matches
+
+def comment_regex_check(prComment, type, custom_regexes={}):
+    if custom_regexes:
+        secret_regexes = custom_regexes
+    else:
+        secret_regexes = regexes
+        
+    regex_matches = []
+    
+    if prComment["body"] == "":
+        return regex_matches
+    
+    for key in secret_regexes:
+        found_strings = secret_regexes[key].findall(prComment["body"])
+        for found_string in found_strings:
+            found_diff = prComment["body"].replace(found_string, bcolors.ENDC + bcolors.WARNING + str(found_string) + bcolors.ENDC + bcolors.OKGREEN)
+        if found_strings:
+            foundRegex = {}
+            foundRegex['type'] = type
+            foundRegex['createdAt'] = prComment["created_at"]
+            foundRegex['updatedAt'] = prComment["updated_at"]
+            foundRegex['htmlUrl'] = prComment["html_url"]
+            foundRegex['blameId'] = prComment["user"]["id"]
+            foundRegex['blameUsername'] = prComment["user"]["login"]
+            foundRegex['stringsFound'] = found_strings
+            foundRegex['printDiff'] = found_diff
+            foundRegex['reason'] = key
             regex_matches.append(foundRegex)
     return regex_matches
 
@@ -319,6 +386,65 @@ def path_included(blob, include_patterns=None, exclude_patterns=None):
         return False
     return True
 
+@RateLimiter(max_calls=1000, period=60)
+def get_prs(baseProjectUrl, authHeaders):
+    response = requests.get(f'{baseProjectUrl}/pulls?state=all&per_page=100&page=1', auth=authHeaders)
+    response.raise_for_status()
+    prs = response.json()
+    
+    while 'next' in response.links.keys():
+        response=requests.get(response.links['next']['url'], auth=authHeaders)
+        response.raise_for_status()
+        prs.extend(response.json())
+        
+    return prs
+    
+@RateLimiter(max_calls=1000, period=60)
+def get_issues(baseProjectUrl, authHeaders):
+    response = requests.get(f'{baseProjectUrl}/issues?state=all&per_page=100&page=1', auth=authHeaders)
+    response.raise_for_status()
+    issues = response.json()
+    
+    while 'next' in response.links.keys():
+        response=requests.get(response.links['next']['url'], auth=authHeaders)
+        response.raise_for_status()
+        issues.extend(response.json())
+        
+    return issues
+
+def find_strings_in_comments(github_url, github_username, github_token, printJson=False):
+    parts = github_url.split("/")
+    owner = parts[-2]
+    repo = parts[-1].split(".")[0]
+    repoUrl=f'https://api.github.com/repos/{owner}/{repo}'
+    auth=(github_username, github_token)
+    regex_matches = []
+    
+    prs = get_prs(repoUrl, auth)
+    for pr in prs:
+        response = requests.get(pr["review_comments_url"], auth=auth)
+        response.raise_for_status()
+        pr_comments = response.json()
+        
+        for pr_comment in pr_comments:
+            regex_matches.extend(comment_regex_check(pr_comment, "PR Comment"))
+
+    issues = get_issues(repoUrl, auth)
+    for issue in issues:
+        if issue["comments"] == 0:
+            continue
+        
+        response = requests.get(issue["comments_url"], auth=auth)
+        response.raise_for_status()
+        issue_comments = response.json()
+        
+        for issue_comment in issue_comments:
+            regex_matches.extend(comment_regex_check(issue_comment, "Issue Comment"))
+     
+    for match in regex_matches:
+        print_comment_results(printJson, match)
+        
+    return regex_matches
 
 def find_strings(git_url, since_commit=None, max_depth=1000000, printJson=False, do_regex=False, do_entropy=True, surpress_output=True,
                 custom_regexes={}, branch=None, repo_path=None, path_inclusions=None, path_exclusions=None, allow={}):
